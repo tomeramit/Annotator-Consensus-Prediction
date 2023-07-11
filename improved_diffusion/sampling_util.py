@@ -13,10 +13,6 @@ from mpi4py import MPI
 from sklearn.metrics import f1_score, jaccard_score
 from torch.utils.data import DataLoader
 
-from datasets.QUBIC import QUBIKDataset
-from datasets.disc_region import DiscRegionDataset
-from datasets.monu import MonuDataset
-from datasets.multi_annotators_datasets import MultiAnnotatorsDataset
 from . import dist_util
 from .metrics import FBound_metric, WCov_metric
 from .qubiq_metrics import qubiq_metric
@@ -56,7 +52,6 @@ def calculate_metrics(x, gt):
 def sampling_major_vote_func(diffusion_model, ddp_model, output_folder, dataset, logger, clip_denoised, step, number_of_generated_instances=9):
     ddp_model.eval()
     batch_size = 1
-    major_vote_number = number_of_generated_instances
     logger.info(f"number of images to visualize {len(dataset)}")
     loader = DataLoader(dataset, batch_size=batch_size)
     name_unique_prefix = MPI.COMM_WORLD.Get_rank()
@@ -70,12 +65,8 @@ def sampling_major_vote_func(diffusion_model, ddp_model, output_folder, dataset,
     with torch.no_grad():
         for index, (gt_mask, condition_on, name) in enumerate(loader):
 
-            if isinstance(dataset, QUBIKDataset):
-                set_random_seed_for_iterations(step + int(name[0].split("_")[0][-2:]))
-            elif isinstance(dataset, DiscRegionDataset):
-                set_random_seed_for_iterations(step + int(name[0].split("_")[-1][5:]))
-            else:
-                set_random_seed_for_iterations(step + int(name[0].split("_")[1]))
+            set_random_seed_for_iterations(step + int(name[0].split("_")[0][-2:]))
+
             gt_mask = (gt_mask + 1.0) / 2.0
             condition_on_image = condition_on["conditioned_image"]
             former_frame_for_feature_extraction = condition_on_image.to(dist_util.dev())
@@ -86,123 +77,48 @@ def sampling_major_vote_func(diffusion_model, ddp_model, output_folder, dataset,
                 gt_img.save(
                     os.path.join(output_folder, f"{index}_{name_unique_prefix}_{name[0]}_gt_colormap.png"))
 
-            if isinstance(dataset, MultiAnnotatorsDataset):
-                annotator_gt = gt_mask * dataset.number_of_annotators
-                for i in range(dataset.number_of_annotators):
-                    gt_img = Image.fromarray((annotator_gt >= (i + 1))[0][0].detach().cpu().numpy().astype('uint8'))
-                    gt_img.putpalette(cityspallete)
-                    gt_img.save(
-                        os.path.join(output_folder, f"{index}_{name_unique_prefix}_{name[0]}_gt_annotator_{i + 1}_palette.png"))
+            annotator_gt = gt_mask * dataset.number_of_annotators
+            for i in range(dataset.number_of_annotators):
+                gt_img = Image.fromarray((annotator_gt >= (i + 1))[0][0].detach().cpu().numpy().astype('uint8'))
+                gt_img.putpalette(cityspallete)
+                gt_img.save(
+                    os.path.join(output_folder, f"{index}_{name_unique_prefix}_{name[0]}_gt_annotator_{i + 1}_palette.png"))
 
             for i in range(condition_on_image.shape[0]):
                 denorm_condition_on = denormalize(condition_on_image.clone(), mean=dataset.mean, std=dataset.std)
-                # denorm_condition_mask = denorm_condition_on.clone()
-                # denorm_condition_mask[denorm_condition_mask <= 20] = 0
-                # denorm_condition_mask[denorm_condition_mask > 20] = 1
-                if isinstance(dataset, MultiAnnotatorsDataset):
-                    tvu.save_image(
-                        denorm_condition_on[i,] / denorm_condition_on.max(),
-                        os.path.join(output_folder, f"{index}_{name_unique_prefix}_{name[0]}_condition_on_image.png")
-                    )
-                else:
-                    tvu.save_image(
-                        denorm_condition_on[i,] / 255.,
-                        os.path.join(output_folder, f"{index}_{name_unique_prefix}_{name[0]}_condition_on_image.png")
-                    )
 
-            if isinstance(dataset, MonuDataset):
-                _, _, W, H = former_frame_for_feature_extraction.shape
-                kernel_size = dataset.image_size
-                stride = 256
-                patches = []
-                for y, x in np.ndindex((((W - kernel_size) // stride) + 1, ((H - kernel_size) // stride) + 1)):
-                    y = y * stride
-                    x = x * stride
-                    patches.append(former_frame_for_feature_extraction[0,
-                        :,
-                        y: min(y + kernel_size, W),
-                        x: min(x + kernel_size, H)])
-                patches = torch.stack(patches)
+                tvu.save_image(
+                    denorm_condition_on[i,] / denorm_condition_on.max(),
+                    os.path.join(output_folder, f"{index}_{name_unique_prefix}_{name[0]}_condition_on_image.png")
+                )
 
-                major_vote_list = []
-                for i in range(major_vote_number):
-                    x_list = []
+            model_kwargs = {
+                "inference": True,
+                "first_time_step": diffusion_model.num_timesteps
+            }
 
-                    for index in range(math.ceil(patches.shape[0] / 4)):
-                        model_kwargs = {"conditioned_image": patches[index * 4: min((index + 1) * 4, patches.shape[0])]}
-                        x = diffusion_model.p_sample_loop(
-                                ddp_model,
-                                (model_kwargs["conditioned_image"].shape[0], gt_mask.shape[1], model_kwargs["conditioned_image"].shape[2], model_kwargs["conditioned_image"].shape[3]),
-                                progress=True,
-                                clip_denoised=clip_denoised,
-                                model_kwargs=model_kwargs
-                            )
+            if ddp_model.soft_label_training:
+                model_kwargs["conditioned_image"] = torch.cat([former_frame_for_feature_extraction])
+                first_dim = 1
 
-                        x_list.append(x)
-                    out = torch.cat(x_list)
+            else: #consensus or annotators
+                if not ddp_model.no_annotator_training:
+                    model_kwargs["number_of_annotators"] = torch.range(1, dataset.number_of_annotators, dtype=torch.int).to(dist_util.dev())
+                model_kwargs["conditioned_image"] = torch.cat([former_frame_for_feature_extraction] * dataset.number_of_annotators)
+                first_dim = dataset.number_of_annotators
 
-                    output = torch.zeros((former_frame_for_feature_extraction.shape[0], gt_mask.shape[1], former_frame_for_feature_extraction.shape[2], former_frame_for_feature_extraction.shape[3]))
-                    idx_sum = torch.zeros((former_frame_for_feature_extraction.shape[0], gt_mask.shape[1], former_frame_for_feature_extraction.shape[2], former_frame_for_feature_extraction.shape[3]))
-                    for index, val in enumerate(out):
-                        y, x = np.unravel_index(index, (((W - kernel_size) // stride) + 1, ((H - kernel_size) // stride) + 1))
-                        y = y * stride
-                        x = x * stride
-
-                        idx_sum[0,
-                        :,
-                        y: min(y + kernel_size, W),
-                        x: min(x + kernel_size, H)] += 1
-
-                        output[0,
-                        :,
-                        y: min(y + kernel_size, W),
-                        x: min(x + kernel_size, H)] += val[:, :min(y + kernel_size, W) - y, :min(x + kernel_size, H) - x].cpu().data.numpy()
-
-                    output = output / idx_sum
-                    major_vote_list.append(output)
-
-                x = torch.cat(major_vote_list)
-            elif isinstance(dataset, MultiAnnotatorsDataset):
-                model_kwargs = {
-                    "inference": True,
-                    "first_time_step": diffusion_model.num_timesteps
-                }
-
-                if ddp_model.soft_label_training:
-                    model_kwargs["conditioned_image"] = torch.cat([former_frame_for_feature_extraction])
-                    first_dim = 1
-                    # model_kwargs["number_of_annotators"] = None
-
-                else: #consensus or annotators
-                    if not ddp_model.no_annotator_training:
-                        model_kwargs["number_of_annotators"] = torch.range(1, dataset.number_of_annotators, dtype=torch.int).to(dist_util.dev())
-                    model_kwargs["conditioned_image"] = torch.cat([former_frame_for_feature_extraction] * dataset.number_of_annotators)
-                    first_dim = dataset.number_of_annotators
-
-                list_of_x = []
-                for i in range(number_of_generated_instances):
-                    x = diffusion_model.p_sample_loop(
-                        ddp_model,
-                        (first_dim, gt_mask.shape[1], former_frame_for_feature_extraction.shape[2],
-                         former_frame_for_feature_extraction.shape[3]),
-                        progress=True,
-                        clip_denoised=clip_denoised,
-                        model_kwargs=model_kwargs
-                    )
-                    list_of_x.append(x)
-                x = torch.stack(list_of_x)
-            else:
-                model_kwargs = {
-                    "conditioned_image": torch.cat([former_frame_for_feature_extraction] * major_vote_number)}
-
+            list_of_x = []
+            for i in range(number_of_generated_instances):
                 x = diffusion_model.p_sample_loop(
                     ddp_model,
-                    (major_vote_number, gt_mask.shape[1], former_frame_for_feature_extraction.shape[2],
+                    (first_dim, gt_mask.shape[1], former_frame_for_feature_extraction.shape[2],
                      former_frame_for_feature_extraction.shape[3]),
                     progress=True,
                     clip_denoised=clip_denoised,
                     model_kwargs=model_kwargs
                 )
+                list_of_x.append(x)
+            x = torch.stack(list_of_x)
 
             x = (x + 1.0) / 2.0
 
@@ -214,17 +130,16 @@ def sampling_major_vote_func(diffusion_model, ddp_model, output_folder, dataset,
 
             x = torch.clamp(x, 0.0, 1.0)
             cm = plt.get_cmap('bwr')
-            if isinstance(dataset, MultiAnnotatorsDataset):
-                for gen_im in range(x.shape[0]):
-                    for annotator in range(x.shape[1]):
-                        out_img = Image.fromarray(x[gen_im][annotator][0].round().detach().cpu().numpy().astype('uint8'))
-                        out_img.putpalette(cityspallete)
-                        out_img.save(
-                            os.path.join(output_folder, f"{index}_{name_unique_prefix}_{name[0]}_model_output_annotator_{annotator+1}_vote_{gen_im}_binary.png"))
+            for gen_im in range(x.shape[0]):
+                for annotator in range(x.shape[1]):
+                    out_img = Image.fromarray(x[gen_im][annotator][0].round().detach().cpu().numpy().astype('uint8'))
+                    out_img.putpalette(cityspallete)
+                    out_img.save(
+                        os.path.join(output_folder, f"{index}_{name_unique_prefix}_{name[0]}_model_output_annotator_{annotator+1}_vote_{gen_im}_binary.png"))
 
-                        out_img = Image.fromarray((cm((x[gen_im][annotator][0].detach().cpu().numpy()))[:, :, :3] * 255).astype(np.uint8))
-                        out_img.save(
-                            os.path.join(output_folder, f"{index}_{name_unique_prefix}_{name[0]}_model_output_annotator_{annotator+1}_vote_{gen_im}_colormap.png"))
+                    out_img = Image.fromarray((cm((x[gen_im][annotator][0].detach().cpu().numpy()))[:, :, :3] * 255).astype(np.uint8))
+                    out_img.save(
+                        os.path.join(output_folder, f"{index}_{name_unique_prefix}_{name[0]}_model_output_annotator_{annotator+1}_vote_{gen_im}_colormap.png"))
 
             # major vote result
             x = x.mean(dim=0)
@@ -240,7 +155,7 @@ def sampling_major_vote_func(diffusion_model, ddp_model, output_folder, dataset,
                 out_img.save(
                     os.path.join(output_folder, f"{index}_{name_unique_prefix}_{name[0]}_model_output_major_vote_annotator_{i+1}_colormap.png"))
 
-            if isinstance(dataset, MultiAnnotatorsDataset) and not ddp_model.soft_label_training and not ddp_model.no_annotator_training:
+            if not ddp_model.soft_label_training and not ddp_model.no_annotator_training:
                 x = x.round()
                 if ddp_model.consensus_training:
                     annotator_gt = gt_mask * dataset.number_of_annotators
@@ -271,26 +186,25 @@ def sampling_major_vote_func(diffusion_model, ddp_model, output_folder, dataset,
 
             for i, (gt_eval, out_im) in enumerate(zip(gt_mask, x)):
 
-                if isinstance(dataset, MultiAnnotatorsDataset):
-                    b = out_im.unsqueeze(0).detach().cpu() # * denorm_condition_mask
-                    # b[b<0.5] = 0 #need to make this as hyper parameter
-                    avg_dice, dice_score_list = qubiq_metric(b.unsqueeze(0), gt_eval.unsqueeze(0).detach().cpu(), num_of_thresholds=9)
-                    soft_dice_score_list_9.append(avg_dice)
+                b = out_im.unsqueeze(0).detach().cpu() # * denorm_condition_mask
+                # b[b<0.5] = 0 #need to make this as hyper parameter
+                avg_dice, dice_score_list = qubiq_metric(b.unsqueeze(0), gt_eval.unsqueeze(0).detach().cpu(), num_of_thresholds=9)
+                soft_dice_score_list_9.append(avg_dice)
 
-                    logger.info(
-                        f"{name_unique_prefix}_{index}_{name[0]} soft dice 9 {soft_dice_score_list_9[-1]}")
+                logger.info(
+                    f"{name_unique_prefix}_{index}_{name[0]} soft dice 9 {soft_dice_score_list_9[-1]}")
 
-                    logger.info(
-                        f"{name_unique_prefix}_{index}_{name[0]} soft dice list {dice_score_list}")
+                logger.info(
+                    f"{name_unique_prefix}_{index}_{name[0]} soft dice list {dice_score_list}")
 
-                    avg_dice, dice_score_list = qubiq_metric(b.unsqueeze(0), gt_eval.unsqueeze(0).detach().cpu(), num_of_thresholds=5)
-                    soft_dice_score_list_5.append(avg_dice)
+                avg_dice, dice_score_list = qubiq_metric(b.unsqueeze(0), gt_eval.unsqueeze(0).detach().cpu(), num_of_thresholds=5)
+                soft_dice_score_list_5.append(avg_dice)
 
-                    logger.info(
-                        f"{name_unique_prefix}_{index}_{name[0]} soft dice 5 {soft_dice_score_list_5[-1]}")
+                logger.info(
+                    f"{name_unique_prefix}_{index}_{name[0]} soft dice 5 {soft_dice_score_list_5[-1]}")
 
-                    logger.info(
-                        f"{name_unique_prefix}_{index}_{name[0]} soft dice list {dice_score_list}")
+                logger.info(
+                    f"{name_unique_prefix}_{index}_{name[0]} soft dice list {dice_score_list}")
 
                 out_im = out_im.round().int()
                 gt_eval = gt_eval.round().int()
