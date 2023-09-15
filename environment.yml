@@ -1,4 +1,4 @@
-name: segdif
+name: cons
 channels:
   - huggingface
   - pytorch
@@ -165,4 +165,3 @@ dependencies:
     - tokenizers==0.13.1
     - transformers==4.24.0
     - xmltodict==0.12.0
-prefix: /media/data1/tomeramit/miniconda/envs/segdif
